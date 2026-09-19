@@ -264,30 +264,64 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	if (x != 0 || y != 0)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
-	/* Wait out any held-back decode and pending conversion first. */
+	/* The V4L2R_*_GET() lookups above only held drv->mutex for the lookup
+	 * itself, so nothing keeps the objects alive afterwards. Take the mutex
+	 * for real and re-resolve both handles: a concurrent context teardown
+	 * (capture_buffer_cleanup() -> munmap()) can destroy the surface and
+	 * unmap the CAPTURE buffer between the lookup and the copy below, which
+	 * then reads from unmapped memory and faults. Everything that touches
+	 * the mapping stays inside this critical section. */
+	pthread_mutex_lock(&drv->mutex);
+
+	surface = V4L2R_SURFACE(drv, surface_id);
+	if (!surface) {
+		status = VA_STATUS_ERROR_INVALID_SURFACE;
+		goto out;
+	}
+
+	image_object = V4L2R_IMAGE(drv, image_id);
+	if (!image_object) {
+		status = VA_STATUS_ERROR_INVALID_IMAGE;
+		goto out;
+	}
+	image = &image_object->image;
+
+	/* Wait out any held-back decode and pending conversion. This has to
+	 * happen under the mutex too: done before it, the CAPTURE buffer can be
+	 * recycled between the wait and the copy, which then reads the wrong
+	 * frame. Nothing on this path takes drv->mutex, and it only waits on
+	 * work already submitted to the kernel, so holding it cannot deadlock. */
 	status = v4l2r_surface_ready(surface);
 	if (status != VA_STATUS_SUCCESS)
-		return status;
+		goto out;
 
 	status = v4l2r_surface_view(drv, surface, true, &view);
 	if (status != VA_STATUS_SUCCESS)
-		return status;
+		goto out;
 
-	if (!view.info->linear || !view.info->va_fourcc)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
+	if (!view.info->linear || !view.info->va_fourcc) {
+		status = VA_STATUS_ERROR_OPERATION_FAILED;
+		goto out;
+	}
 
-	if (image->format.fourcc != view.info->va_fourcc)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
+	if (image->format.fourcc != view.info->va_fourcc) {
+		status = VA_STATUS_ERROR_OPERATION_FAILED;
+		goto out;
+	}
 
 	/* Bound the copy by both the surface view and the destination image so
 	 * a region larger than the image cannot overrun its buffer. */
 	if (width > view.width || height > view.height ||
-	    width > image->width || height > image->height)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
+	    width > image->width || height > image->height) {
+		status = VA_STATUS_ERROR_OPERATION_FAILED;
+		goto out;
+	}
 
-	buffer = V4L2R_BUFFER_GET(drv, image->buf);
-	if (!buffer)
-		return VA_STATUS_ERROR_INVALID_BUFFER;
+	buffer = V4L2R_BUFFER(drv, image->buf);
+	if (!buffer) {
+		status = VA_STATUS_ERROR_INVALID_BUFFER;
+		goto out;
+	}
 
 	src_luma = view.map[0];
 	if (view.nb_planes > 1)
@@ -312,7 +346,8 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 		       (size_t)view.pitch * height);
 		memcpy(dst + image->offsets[1], src_chroma,
 		       (size_t)view.pitch * ((height + 1) / 2));
-		return VA_STATUS_SUCCESS;
+		status = VA_STATUS_SUCCESS;
+		goto out;
 	}
 
 	for (unsigned int i = 0; i < height; i++)
@@ -323,7 +358,11 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 		memcpy(dst + image->offsets[1] + i * image->pitches[1],
 		       src_chroma + i * view.pitch, row_size);
 
-	return VA_STATUS_SUCCESS;
+	status = VA_STATUS_SUCCESS;
+
+out:
+	pthread_mutex_unlock(&drv->mutex);
+	return status;
 }
 
 VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,

@@ -896,11 +896,15 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 	for (unsigned int i = 0; i < V4L2R_OUTPUT_BUFFERS; i++)
 		output_buffer_cleanup(ctx, &ctx->output[i]);
 
+	/* Unmapping the CAPTURE buffers and detaching surfaces both have to
+	 * happen under drv->mutex: v4l2r_GetImage() reads these mappings while
+	 * holding it, and would otherwise fault on memory unmapped here. */
+	pthread_mutex_lock(&drv->mutex);
+
 	for (unsigned int i = 0; i < ctx->nb_captures; i++)
 		capture_buffer_cleanup(ctx, &ctx->captures[i]);
 
 	/* Detach surfaces that were attached but never bound. */
-	pthread_mutex_lock(&drv->mutex);
 	while ((surface = v4l2r_handles_next(&drv->surfaces, &iter, NULL))) {
 		if (surface->ctx == ctx) {
 			surface->ctx = NULL;
