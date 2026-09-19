@@ -205,6 +205,15 @@ VAStatus v4l2r_surface_view(struct v4l2r_driver *drv,
 			    struct v4l2r_surface *surface, bool need_maps,
 			    struct v4l2r_frame_view *view);
 void v4l2r_surface_free_backing(struct v4l2r_surface *surface);
+/* Mirror a finished decode from the CAPTURE buffer into the surface's
+ * standalone backing (the storage a client exported before the first decode). */
+void v4l2r_surface_present_copy(struct v4l2r_surface *surface);
+/* Ensure the surface has standalone storage that can be imported as a CAPTURE
+ * buffer (DMABUF mode). No-op when it already has backing. */
+VAStatus v4l2r_surface_import_backing(struct v4l2r_driver *drv,
+				      struct v4l2r_surface *surface,
+				      uint32_t width, uint32_t height,
+				      uint32_t pixelformat);
 
 /* Per CAPTURE buffer state, lives in the context that allocated it. The
  * buffer holds the current decoded content of ->surface, or is free when
@@ -265,6 +274,12 @@ static inline size_t v4l2r_buffer_bytes(const struct v4l2r_buffer *buf)
 
 struct v4l2r_context {
 	struct v4l2r_driver *drv;
+	/* V4L2_MEMORY_* for the CAPTURE queue, 0 until the first buffer is
+	 * allocated. DMABUF means decodes land straight in the surface's
+	 * exported backing (zero copy); MMAP means the decoder owns the
+	 * buffers and finished frames are mirrored across by
+	 * v4l2r_surface_present_copy(). */
+	uint32_t capture_memory;
 	VAConfigID config_id;
 	VAProfile profile;
 	const struct v4l2r_codec *codec;

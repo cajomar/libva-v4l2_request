@@ -103,9 +103,20 @@ static int queue_buffer(struct v4l2r_context *ctx, struct v4l2_buffer *buffer)
 	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
 
 	if (V4L2_TYPE_IS_MULTIPLANAR(buffer->type)) {
+		unsigned int nb_planes = buffer->length ? buffer->length : 1;
+
+		/* Keep whatever the caller already put in the plane array -
+		 * for an imported CAPTURE queue that is the dma-buf fd and
+		 * length of the surface's own buffer. Overwriting it here sent
+		 * the kernel a zeroed fd, which vb2 rejects with "invalid
+		 * dmabuf fd". Only the bytesused fixup below belongs to us. */
+		if (buffer->m.planes && nb_planes <= VIDEO_MAX_PLANES)
+			memcpy(planes, buffer->m.planes,
+			       sizeof(planes[0]) * nb_planes);
+
 		planes[0].bytesused = buffer->bytesused;
 		buffer->bytesused = 0;
-		buffer->length = 1;
+		buffer->length = nb_planes;
 		buffer->m.planes = planes;
 	}
 
@@ -136,11 +147,36 @@ static int queue_buffer(struct v4l2r_context *ctx, struct v4l2_buffer *buffer)
 
 static int queue_capture_buffer(struct v4l2r_context *ctx, uint32_t index)
 {
+	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
 	struct v4l2_buffer buffer = {
 		.index = index,
 		.type = ctx->capture_format.type,
-		.memory = V4L2_MEMORY_MMAP,
+		.memory = ctx->capture_memory ? ctx->capture_memory :
+						V4L2_MEMORY_MMAP,
 	};
+
+	/* Importing: point the buffer at the surface's exported dma-buf so the
+	 * decoder writes the frame where the client is already looking. */
+	if (buffer.memory == V4L2_MEMORY_DMABUF) {
+		struct v4l2r_surface *surface = ctx->captures[index].surface;
+		struct v4l2r_surface_backing *backing =
+			surface ? surface->backing : NULL;
+
+		if (!backing)
+			return -EINVAL;
+
+		if (V4L2_TYPE_IS_MULTIPLANAR(buffer.type)) {
+			buffer.length = backing->nb_planes;
+			buffer.m.planes = planes;
+			for (unsigned int i = 0; i < backing->nb_planes; i++) {
+				planes[i].m.fd = backing->dmabuf_fd[i];
+				planes[i].length = backing->plane_size[i];
+			}
+		} else {
+			buffer.m.fd = backing->dmabuf_fd[0];
+			buffer.length = backing->plane_size[0];
+		}
+	}
 
 	return queue_buffer(ctx, &buffer);
 }
@@ -167,7 +203,8 @@ static int dequeue_buffer(struct v4l2r_context *ctx, enum v4l2_buf_type type)
 	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
 	struct v4l2_buffer buffer = {
 		.type = type,
-		.memory = V4L2_MEMORY_MMAP,
+		.memory = (!V4L2_TYPE_IS_OUTPUT(type) && ctx->capture_memory) ?
+			  ctx->capture_memory : V4L2_MEMORY_MMAP,
 	};
 
 	if (V4L2_TYPE_IS_MULTIPLANAR(type)) {
@@ -195,9 +232,14 @@ static int dequeue_buffer(struct v4l2r_context *ctx, enum v4l2_buf_type type)
 			ctx->captures[buffer.index].surface->status =
 				VASurfaceReady;
 			/* Start the format conversion right away so it
-			 * overlaps subsequent decodes. */
+			 * overlaps subsequent decodes. Without a converter,
+			 * mirror the frame into any standalone backing the
+			 * client already exported and is presenting. */
 			if (ctx->conv)
 				v4l2r_convert_kick(ctx, buffer.index);
+			else if (ctx->capture_memory != V4L2_MEMORY_DMABUF)
+				v4l2r_surface_present_copy(
+					ctx->captures[buffer.index].surface);
 		}
 	}
 
